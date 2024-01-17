@@ -1,5 +1,7 @@
-use std::ops::SubAssign;
+#![feature(array_methods)]
 
+use std::ops::SubAssign;
+use std::cmp::Ordering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CompletionRequirement {
@@ -92,7 +94,7 @@ struct Order {
     details: Details,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct Details {
     creq: CompletionRequirement,
     customer: CustomerID,
@@ -106,10 +108,27 @@ struct Identifier {
     prob: Contribution,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct OutstandingOrder {
     orderid: u64,
     details: Details,
+}
+
+impl Ord for OutstandingOrder {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Sort by price, then by orderid
+        match self.details.prob.partial_cmp(&other.details.prob) {
+            None => panic!("NANS IN THE SYSTEM AAAAAAA"),
+            Some(Ordering::Equal) => self.orderid.cmp(&other.orderid).reverse(),
+            Some(c) => c,
+        }
+    }
+}
+
+impl PartialOrd for OutstandingOrder {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(&other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +179,6 @@ fn make_transaction<const N: usize> (orders: [& mut Details; N]) -> TransactionO
     }
 }
 
-
 #[derive(Debug)]
 struct MatchingEngine<const N: usize> {
     book: [Vec<OutstandingOrder>; N],
@@ -180,14 +198,9 @@ struct MatchingEngine<const N: usize> {
 // orders which are the same in both of those attributes of those two. In
 // fact, the timestamp could just be an incrementing counter that gets
 // assigned when the entry is added to the book.
-
+ 
 // Alternatively, NOTHING
 // Alternatively cry. This is how it's gonna work
-
-// Having duplicates for yes/no everything sucks
-// A binary option is just a special case of the more general disjoint set
-// option.
-// Is there some way of doing this?
 
 // TODO: Replace arrays with priority queues?
 impl<const N: usize> MatchingEngine<N> {
@@ -202,42 +215,26 @@ impl<const N: usize> MatchingEngine<N> {
     {
         assert!(I < N);
 
-        let mut identifier = None;
+        let mut identifier = Some(self.insert_order::<I>(order.details));
 
         let mut transactions = vec![];
 
-        let mut done = false;
-
-        while !done {
-            let (before, after) = self.book.split_at_mut(I);
-            let k = before.iter_mut()
-                .map(|v: &mut Vec<OutstandingOrder>| v.last_mut().map(|o| &mut o.details))
-                .chain(Some(Some(&mut order.details)))
-                .chain(after.iter_mut().skip(1)
-                       .map(|v: &mut Vec<OutstandingOrder>| v.last_mut().map(|o| &mut o.details)))
-                .collect::<Option<Vec<&mut Details>>>();
-            match k {
-                None => {
-                    identifier = Some(self.insert_order::<I>(order.details));
+        loop {
+            let orders = self.book.each_mut().map(|k| k.last_mut());
+            if orders.iter().any(|v| v.is_none()) { break };
+            let orders = orders.map(|o| &mut o.unwrap().details);
+            match make_transaction(orders) {
+                TransactionOutcome::Failure => {
                     break;
                 }
-                Some(orders) => {
-                    match make_transaction(orders.try_into().unwrap()) {
-                        TransactionOutcome::Failure => {
-                            identifier = Some(self.insert_order::<I>(order.details));
-                            break;
+                TransactionOutcome::Success(a, b) => {
+                    transactions.push(a);
+                    for i in b {
+                        let removed = self.book[i].pop();
+                        if identifier.as_ref().is_some_and(|i| removed.as_ref().is_some_and(|r| r.orderid == i.id)) {
+                            identifier = None;
                         }
-                        TransactionOutcome::Success(a, b) => {
-                            transactions.push(a);
-                            for i in b {
-                                if i == I {
-                                    done = true;
-                                } else {
-                                    let removed = self.book[i].pop();
-                                    assert_eq!(removed.map(|o| o.details.volume), Some(Volume(0)));
-                                }
-                            }
-                        }
+                        assert_eq!(removed.map(|o| o.details.volume), Some(Volume(0)));
                     }
                 }
             }
@@ -246,10 +243,6 @@ impl<const N: usize> MatchingEngine<N> {
         (identifier, transactions)
     }
     
-    // TODO: If an incoming order has been filled at all, the order currently on the end of the list
-    // can't possibly be better than it, because if it were, it would have matched with the orders
-    // that the incoming order matched with. So we can just stick the oncoming order on the end of
-    // the list
     fn insert_order<const I: usize>(&mut self, order: Details) -> Identifier {
         assert!(I < N);
         
@@ -480,5 +473,58 @@ mod tests {
         assert_eq!(m.cancel_order::<1>(id1).map(|o| o.details), Some(o1.clone().details));
 
         assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o3.details], vec![]]);
+    }
+}
+
+
+#[cfg(test)]
+mod ordertest {
+    use super::*;
+    #[test]
+    fn test1() {
+        let c1 = CustomerID(0);
+        let c2 = CustomerID(1);
+        let c3 = CustomerID(2);
+        let o1 = OutstandingOrder {
+            orderid: 1,
+            details: Details {
+                creq: CompletionRequirement::PartialOk,
+                customer: c1,
+                volume: Volume(10),
+                prob: Contribution::from_float(0.4),
+            }
+        };
+        let o2 = OutstandingOrder {
+            orderid: 2,
+            details: Details {
+                creq: CompletionRequirement::PartialOk,
+                customer: c1,
+                volume: Volume(10),
+                prob: Contribution::from_float(0.4),
+            }
+        };
+        let o3 = OutstandingOrder {
+            orderid: 1,
+            details: Details {
+                creq: CompletionRequirement::PartialOk,
+                customer: c1,
+                volume: Volume(10),
+                prob: Contribution::from_float(0.7),
+            }
+        };
+        let o4 = OutstandingOrder {
+            orderid: 1,
+            details: Details {
+                creq: CompletionRequirement::FillOnly,
+                customer: c2,
+                volume: Volume(20),
+                prob: Contribution::from_float(0.4),
+            }
+        };
+
+        assert_eq!(o1.cmp(&o2), Ordering::Greater);
+        assert_eq!(o1.cmp(&o3), Ordering::Less);
+        assert_eq!(o1.cmp(&o4), Ordering::Equal);
+        assert!(o1 != o4);
     }
 }
