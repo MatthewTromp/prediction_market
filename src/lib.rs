@@ -2,6 +2,7 @@
 
 use std::ops::SubAssign;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CompletionRequirement {
@@ -89,12 +90,12 @@ struct CustomerID(usize);
 // An "outstanding" is an order in the order book
 // Details are common between oders and outstandings
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Order {
     details: Details,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Details {
     creq: CompletionRequirement,
     customer: CustomerID,
@@ -102,26 +103,47 @@ struct Details {
     prob: Contribution,    
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Identifier {
     id: u64,
     prob: Contribution,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+impl Ord for Identifier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Sort by price, then by orderid
+        match self.prob.partial_cmp(&other.prob) {
+            None => panic!("NANS IN THE SYSTEM AAAAAAA"),
+            Some(Ordering::Equal) => self.id.cmp(&other.id).reverse(),
+            Some(c) => c,
+        }
+    }
+}
+
+impl PartialOrd for Identifier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct OutstandingOrder {
     orderid: u64,
     details: Details,
 }
 
+impl OutstandingOrder {
+    fn identifier(&self) -> Identifier {
+        Identifier {
+            id: self.orderid,
+            prob: self.details.prob,
+        }
+    }
+}
+
 impl Ord for OutstandingOrder {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Sort by price, then by orderid
-        match self.details.prob.partial_cmp(&other.details.prob) {
-            None => panic!("NANS IN THE SYSTEM AAAAAAA"),
-            Some(Ordering::Equal) => self.orderid.cmp(&other.orderid).reverse(),
-            Some(c) => c,
-        }
+        self.identifier().cmp(&other.identifier())
     }
 }
 
@@ -181,7 +203,7 @@ fn make_transaction<const N: usize> (orders: [& mut Details; N]) -> TransactionO
 
 #[derive(Debug)]
 struct MatchingEngine<const N: usize> {
-    book: [Vec<OutstandingOrder>; N],
+    book: [BTreeMap<Identifier, OutstandingOrder>; N],
     next_id: u64,
 }
 
@@ -202,11 +224,10 @@ struct MatchingEngine<const N: usize> {
 // Alternatively, NOTHING
 // Alternatively cry. This is how it's gonna work
 
-// TODO: Replace arrays with priority queues?
 impl<const N: usize> MatchingEngine<N> {
     fn new() -> Self {
         MatchingEngine {
-            book: [(); N].map(|()| Vec::new()),
+            book: [(); N].map(|()| BTreeMap::new()),
             next_id: 1,
         }
     }
@@ -220,9 +241,11 @@ impl<const N: usize> MatchingEngine<N> {
         let mut transactions = vec![];
 
         loop {
-            let orders = self.book.each_mut().map(|k| k.last_mut());
-            if orders.iter().any(|v| v.is_none()) { break };
-            let orders = orders.map(|o| &mut o.unwrap().details);
+            let entries = self.book.each_mut().map(|k|
+                   k.last_entry());
+            if entries.iter().any(|v| v.is_none()) { break };
+            let orders = entries.map(|mut e| e.unwrap().into_mut());
+            let orders = orders.map(|o| &mut o.details);
             match make_transaction(orders) {
                 TransactionOutcome::Failure => {
                     break;
@@ -230,11 +253,11 @@ impl<const N: usize> MatchingEngine<N> {
                 TransactionOutcome::Success(a, b) => {
                     transactions.push(a);
                     for i in b {
-                        let removed = self.book[i].pop();
-                        if identifier.as_ref().is_some_and(|i| removed.as_ref().is_some_and(|r| r.orderid == i.id)) {
+                        let removed = self.book[i].pop_last();
+                        if identifier.as_ref().is_some_and(|i| removed.as_ref().is_some_and(|(i2, _)| i2.id == i.id)) {
                             identifier = None;
                         }
-                        assert_eq!(removed.map(|o| o.details.volume), Some(Volume(0)));
+                        assert_eq!(removed.map(|(_, o)| o.details.volume), Some(Volume(0)));
                     }
                 }
             }
@@ -254,31 +277,23 @@ impl<const N: usize> MatchingEngine<N> {
             prob: order.prob,
         };
 
-        let insertion_index = self.book[I].iter()
-            .rposition(|other| other.details.prob < order.prob)
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        
         let outstanding_order = OutstandingOrder {
             orderid: id,
             details: order,
         };
         
-        self.book[I].insert(insertion_index, outstanding_order);
+        self.book[I].insert(identifier, outstanding_order);
 
         identifier
     }
 
     pub fn cancel_order<const I: usize>(&mut self, orderid: Identifier) -> Option<OutstandingOrder> {
         assert!(I < N);
-        let orderid = orderid.id;
-        self.book[I].iter()
-            .position(|o| o.orderid == orderid)
-            .map(|i| self.book[I].remove(i))
+        self.book[I].remove(&orderid)
     }
         
     pub fn get_order_book(&self) -> [Vec<OutstandingOrder>; N] {
-        self.book.clone()
+        self.book.each_ref().map(|b| b.iter().map(|(_, o)| o.clone()).collect())
     }
 }
 
