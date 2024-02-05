@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 // An "outstanding" is an order in the order book
 // Details are common between oders and outstandings
 
+use crate::Side;
+
 use super::{Contribution, Volume, CompletionRequirement, CustomerID};
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Order {
@@ -70,15 +72,15 @@ impl PartialOrd for OutstandingOrder {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PH1 {
-    customer: CustomerID,
-    contribution: Contribution,
+pub struct PH1 {
+    pub customer: CustomerID,
+    pub contribution: Contribution,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Transaction<const N: usize> {
-    contributions: [PH1; N],
-    volume: Volume,
+pub struct Transaction<const N: usize> {
+    pub contributions: [PH1; N],
+    pub volume: Volume,
 }
 
 #[derive(Debug)]
@@ -165,7 +167,8 @@ struct MatchingEngine<const N: usize> {
 //   distributed among them in proportion to their volumes
 //  With pro-rata, there's incentive to make a lot of volume available,
 // possibly even more than you actually want filled, so that you capture
-// more of the volume of orders that come in
+// more of the volume of orders that come in. But that's still some non-
+// incentive compatible nonsense!
 //  Issue: if we have very fine-grained prices, both of these fall apart, I
 // think. Because to capture more of the volume, you can just make a new
 // order that's more favorable than the next best by an arbitrarily small
@@ -199,6 +202,9 @@ struct MatchingEngine<const N: usize> {
 //    - Makers have an incentive to lie (but that's mitigated by them losing out
 //      on trades)
 //    - Makers are disadvantaged, so the market will have lower liquidity
+
+//  What about doing pro-rata plus favor takers? That might offset some of the
+// reduced liquidity from favoring takers
 
 // Supporting AON
 // - Transaction system? Do some operations, and undo them if need be?
@@ -246,7 +252,7 @@ impl<const N: usize> MatchingEngine<N> {
         transes
     }
 
-    pub fn handle_fok(&mut self, side: usize, order: Order) -> Option<Vec<Transaction<N>>> {
+    pub fn handle_fok(&mut self, sides: &[Side], order: Order) -> Option<Vec<Transaction<N>>> {
         assert!(side < N);
         let mut iters = self.book.each_ref().map(|b| b.iter());
         let i = iters.each_mut().map(|i| i.next());
