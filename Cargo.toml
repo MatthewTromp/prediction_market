@@ -1,0 +1,10 @@
+[package]
+name = "prediction_market"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ciborium = "0.2.2"
+ciborium-io = { version = "0.2.2", features = ["std"] }
+dotenvy = "0.15.7"
+serde = "1.0.196"

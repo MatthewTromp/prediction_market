@@ -1,0 +1,30 @@
+Create instrument:
+Takes
+ 1. Description of instrument (more details to follow?)
+ 2. Guaranteed resolution date
+Returns
+ 1. ID of instrument
+
+Get instrument:
+Takes
+ 1. ID of instrument
+Returns
+ 1. Description of instrument
+ 2. Guaranteed resolution date
+
+Make position:
+Takes
+ 1. ID of instrument
+ 2. Position (yes/no)
+ 3. Price limit
+ 4. Volume
+Returns
+ 1. ???
+
+Delete position:
+Takes
+ 1. Position ID???
+Returns
+ 1. ???
+
+Not a REST style API but there needs to be a constant stream of notifications from the market about your positions getting filled
