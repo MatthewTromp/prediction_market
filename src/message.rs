@@ -1,4 +1,4 @@
-use crate::{Contribution, CustomerID, InstrumentID, Money, Position, Volume};
+use crate::units::{Contribution, CustomerID, InstrumentID, Money, Position, Volume};
 
 use serde::{Serialize, Deserialize};
 

@@ -62,7 +62,7 @@
 //  Maybe we can maintain an order book, and only trigger auctions when
 // there's enough volume available?
 
-use crate::{Contribution, CustomerID, Volume};
+use crate::units::{Contribution, CustomerID, Volume};
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 struct Order(pub Contribution, pub Volume, pub CustomerID);
@@ -77,7 +77,7 @@ impl CVGraph {
         orders.sort_by(|o1, o2| o2.0.cmp(&o1.0));
         // Accumulate the volumes
         let surface = orders.into_iter()
-            .fold(vec![(Volume(0), Contribution::ONE)],
+            .fold(vec![(Volume::ZERO, Contribution::ONE)],
                 |mut surface, Order(c, v, _)| {
                     let (v_sum, l) = surface.last_mut().unwrap();
                     if (*l).eq(&c) {
@@ -107,7 +107,7 @@ impl CVGraph {
         all_derivs.sort_by_key(|(v, _)| *v);
         
         // Combine the derivatives and return the summed version
-        let surface = all_derivs.into_iter().fold(vec![(Volume(0), init_contrib)], |mut s, (v, c)| {
+        let surface = all_derivs.into_iter().fold(vec![(Volume::ZERO, init_contrib)], |mut s, (v, c)| {
             let (lv, running_c) = s.last_mut().unwrap();
             if (*lv).eq(&v) {
                 *running_c += c;
@@ -124,7 +124,7 @@ impl CVGraph {
     fn derivative(g: &CVGraph) -> (Vec<(Volume, Contribution)>, Contribution) {
         let mut iter = g.0.iter();
         let (vi, ci) = iter.next().unwrap();
-        assert_eq!(*vi, Volume(0));
+        assert_eq!(*vi, Volume::ZERO);
         (iter.fold((vec![], ci), |(mut out, last_c), (v, c)| {
             out.push((*v, *c - *last_c));
             (out, c)
@@ -184,10 +184,10 @@ mod cvgraphtest {
         Contribution::from_float(contrib)
     }
     fn v(volume: u32) -> Volume {
-        Volume(volume)
+        Volume::from_shares(volume)
     }
     fn o(contrib: f64, volume: u32) -> Order{
-        Order(Contribution::from_float(contrib), Volume(volume), CustomerID(0))
+        Order(Contribution::from_float(contrib), v(volume), CustomerID(0))
     }
     #[test]
     fn test_from_orders() {
@@ -213,13 +213,13 @@ mod testsolve {
         Contribution::from_float(contrib)
     }
     fn v(volume: u32) -> Volume {
-        Volume(volume)
+        Volume::from_shares(volume)
     }
     fn i(id: usize) -> CustomerID {
         CustomerID(id)
     }
     fn o(contrib: f64, volume: u32, id: usize) -> Order{
-        Order(Contribution::from_float(contrib), Volume(volume), i(id))
+        Order(Contribution::from_float(contrib), v(volume), i(id))
     }
     #[test]
     fn testsolve() {
@@ -236,7 +236,7 @@ mod testsolve {
         assert_eq!(c2, c(0.7));
         assert_eq!(os2, vec![(i(10), v(30)), (i(11), v(20))]);
 
-        assert_eq!(os1.iter().map(|(_, v)| v.0).sum::<u32>(), os2.iter().map(|(_, v)| v.0).sum::<u32>());
+        assert_eq!(os1.iter().map(|(_, v)| *v).sum::<Volume>(), os2.iter().map(|(_, v)| *v).sum());
 
         assert!(cs.next().is_none());
     }

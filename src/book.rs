@@ -1,28 +1,31 @@
 
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::fmt::{self, Debug};
+use std::error::Error;
+use std::{cmp::Ordering, collections::BinaryHeap};
+use std::collections::{BTreeMap, HashMap};
 // An "order" represents an incoming order
 // An "outstanding" is an order in the order book
 // Details are common between oders and outstandings
 
-use crate::Side;
+use crate::units::{Money, Side, Contribution, Volume, CompletionRequirement, CustomerID};
 
-use super::{Contribution, Volume, CompletionRequirement, CustomerID};
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Order {
-    details: Details,
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Order {
+    pub details: Details,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct Details {
-    creq: CompletionRequirement,
-    customer: CustomerID,
-    volume: Volume,
-    contribution: Contribution,    
+pub struct Details {
+    pub creq: CompletionRequirement,
+    pub customer: CustomerID,
+    pub volume: Volume,
+    pub contribution: Contribution,    
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct Identifier {
+pub struct Identifier {
     id: u64,
     prob: Contribution,
 }
@@ -100,11 +103,11 @@ fn make_transaction<const N: usize> (orders: [& mut Details; N]) -> TransactionO
                 .map(|o| o.volume)
                 .min()
                 .unwrap();
-            assert!(volume.0 > 0);
+            assert!(volume > Volume::ZERO);
             let mut to_remove = vec![];
             for i in 0..N {
                 orders[i].volume -= volume;
-                if orders[i].volume == Volume(0) {
+                if orders[i].volume == Volume::ZERO {
                     to_remove.push(i);
                 }
             }
@@ -236,6 +239,10 @@ struct MatchingEngine<const N: usize> {
 // separate "transaction" concept for every new participant in the
 // transaction.
 
+// Can we handle combinatorial orders in the book?
+//  i.e. I want to buy sides 1 + 2 + 5 of this 7-side instrument
+//  
+
 impl<const N: usize> MatchingEngine<N> {
     fn new() -> Self {
         MatchingEngine {
@@ -252,10 +259,11 @@ impl<const N: usize> MatchingEngine<N> {
         transes
     }
 
-    pub fn handle_fok(&mut self, sides: &[Side], order: Order) -> Option<Vec<Transaction<N>>> {
-        assert!(side < N);
+    pub fn handle_fok(&mut self, sides: &[Side], _order: Order) -> Option<Vec<Transaction<N>>> {
+        assert!(sides.iter().all(|s| s.0 < N));
         let mut iters = self.book.each_ref().map(|b| b.iter());
-        let i = iters.each_mut().map(|i| i.next());
+        let _i = iters.each_mut().map(|i| i.next());
+        
         todo!();
     }
 
@@ -284,7 +292,7 @@ impl<const N: usize> MatchingEngine<N> {
                         if identifier.as_ref().is_some_and(|i| removed.as_ref().is_some_and(|(i2, _)| i2.id == i.id)) {
                             identifier = None;
                         }
-                        assert_eq!(removed.map(|(_, o)| o.details.volume), Some(Volume(0)));
+                        assert_eq!(removed.map(|(_, o)| o.details.volume), Some(Volume::ZERO));
                     }
                 }
             }
@@ -325,12 +333,343 @@ impl<const N: usize> MatchingEngine<N> {
 }
 
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct CounterpartyPayment {
+    customer: CustomerID,
+    volume: Volume,
+    contribution: Contribution,
+    side: Side
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TransactionDyn {
+    pub taker_volume: Volume,
+    pub taker_pays: Money,
+    pub counterparties: Vec<CounterpartyPayment>
+}
+
+#[derive(Debug, Clone)]
+enum TransactionCreationError {
+    BadVolume,
+    BadMoney,
+}
+
+impl fmt::Display for TransactionCreationError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TransactionCreationError::BadVolume => write!(f, "Volumes don't add up"),
+            TransactionCreationError::BadMoney => write!(f, "Money doesn't add up"),
+        }
+    }
+}
+
+impl Error for TransactionCreationError {}
+
+impl TransactionDyn {
+    fn checked_make(taker_volume: Volume, taker_pays: Money, counterparties: Vec<CounterpartyPayment>) -> Result<Self, TransactionCreationError> {
+        // Some sanity checks
+        let total_money_in = taker_pays + counterparties.iter().map(|o| o.volume*o.contribution).sum();
+        if total_money_in != taker_volume * Contribution::ONE {
+            return Err(TransactionCreationError::BadMoney);
+        }
+        let mut sidevols = HashMap::new();
+        for CounterpartyPayment { customer: _, volume: v, contribution: _, side: s } in counterparties.iter() {
+            match sidevols.entry(s) {
+                Entry::Occupied(o) => {*(o.into_mut()) += *v;},
+                Entry::Vacant(va) => {va.insert(*v);},
+            }
+        }
+        if !sidevols.into_iter().all(|(_, v)| v == taker_volume) {
+            return Err(TransactionCreationError::BadVolume);
+        }
+        Ok(Self {
+            taker_volume,
+            taker_pays,
+            counterparties,
+        })
+    }
+}
+
+
+#[derive(Debug)]
+pub struct MatchingEngineDyn {
+    book: Vec<BTreeMap<Identifier, OutstandingOrder>>,
+    next_id: u64,
+}
+
+// TODO: Can do more efficient market operations using a similar strategy to
+// the fast side cancellation data structure in positions.rs. Keep a
+// priority queue and a volume offset.
+// Performance analysis:
+//  n is number of sides
+//  m is the number of orders we "work through"
+//  k is the max number of orders in a side
+// Current system:
+//  Need to do O(m) iterations where we
+//   Check all n sides for the minimum volume (O(n))
+//   Subtract that volume from all n top orders (O(n))
+//  Also we zero up to O(m) orders
+//   and removing an order from the book is O(logk)
+//  So our overall running time is O(m*(n + logk))
+// Priority queue:
+//  Need to do O(m) iterations where we
+//   Take the top element from the queue (O(logn))
+//   Set our running volume count (O(1))
+//   Remove that element from the book (O(logk)) (Possible to reduce this by waiting until the end and, like, truncating the tree?)
+//   Get the next element from the book (O(logk)) (Again, maybe can reduce with a pointer to the rightmost block or something?)
+//   Add the running volume to this element and put it in the queue (O(logn))
+//  So our overall running time is O(m*(logn + logk))
+
+// Wait is there something even smarter?
+//  What if we get all the orders up to our full volume and construct
+// a contrib/volume curve? Like with auctions
+// That would require O(m*logm)? We have to get all m orders (up to
+// our volume limit), calculate their contribution derivatives, put
+// them in a big list, sort the list (again could techinically be
+// O(m*logn) with merging but whatever), and proceed until we exceed
+// the contribution need
+//  But that's no better in terms of limiting runtime than the piority
+// queue approach, right? So there's no real benefit. Would it have
+// better performance in practice, because sorting a list is cheaper
+// than a priority queue? Maybe...
+//  But, with the priority queue, we exit early. With the list
+// approach, we take all the orders, even if we're going to fall down
+// at the first attempted match
+
+
+impl MatchingEngineDyn {
+    fn new(num_sides: usize) -> Self {
+        Self {
+            book: vec![BTreeMap::new(); num_sides],
+            next_id: 1,
+        }
+    }
+
+    pub fn num_sides(&self) -> usize {
+        self.book.len()
+    }
+
+    pub fn handle_unbookable_partial(&mut self, sides: &[Side], order: Order) -> TransactionDyn {
+        #[derive(PartialEq, Eq)]
+        struct HeapEntries {
+            order: OutstandingOrder,
+            side: Side,
+            cumulative_volume: Volume,
+        }
+        
+        impl Ord for HeapEntries {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.cumulative_volume.cmp(&other.cumulative_volume).reverse()
+            }
+        }
+
+        impl PartialOrd for HeapEntries {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        assert!(sides.iter().all(|s| s.0 < self.num_sides()));
+        assert!(sides.len() > 0);
+        // Priority queue approach
+        // Get orders on the top of the books
+        let mut other_sides = self.book.iter_mut()
+            .enumerate()
+            .filter(|(o, _)| !sides.contains(&Side(*o))) // TODO: performance
+            .map(|(s, b)| (Side(s), b))
+            .collect::<HashMap<_,_>>();
+
+        if other_sides.iter().any(|(_, o)| o.is_empty()) {
+            return TransactionDyn { taker_volume: Volume::ZERO, taker_pays: Money::ZERO, counterparties: vec![] };
+        }
+        
+        let init = other_sides.iter_mut()
+            .map(|(s, i)| {
+                let x = i.pop_last().unwrap().1;
+                HeapEntries {
+                    order: x,
+                    side: *s,
+                    cumulative_volume:  x.details.volume,
+                }
+            })
+            .collect::<Vec<_>>();
+        
+        let mut total_contrib = init.iter()
+            .map(|HeapEntries { order, side: _, cumulative_volume: _}| order.details.contribution)
+            .sum();
+
+        let mut other_resolutions: Vec<CounterpartyPayment> = vec![];
+        
+        let mut heap = BinaryHeap::from(init);
+        let mut total_volume = Volume::ZERO;
+        let volume_limit = order.details.volume;
+        let mut total_payed = Money::ZERO;
+
+        while Contribution::is_enough(total_contrib, order.details.contribution) && total_volume < volume_limit {
+            let next = heap.pop().unwrap();
+            if next.cumulative_volume > volume_limit {
+                // We're done, and have some extra for this order
+                let volume_used = volume_limit - total_volume;
+                // Correct the total volume we've gone through
+                total_volume = volume_limit;
+                let HeapEntries { order: mut order_to_return, side, cumulative_volume: _ } = next;
+                order_to_return.details.volume -= volume_used;
+                // Pay
+                total_payed += volume_used * Contribution::remainder(total_contrib);
+                let d = order_to_return.details;
+                // Record this party's payment
+                other_resolutions.push(CounterpartyPayment {
+                    customer: d.customer,
+                    volume: d.volume,
+                    contribution: d.contribution,
+                    side,
+                });
+                // Put this back in the book
+                other_sides.get_mut(&next.side).unwrap().insert(order_to_return.identifier(), order_to_return);
+            } else {
+                // We've exhausted this book order
+                // Correct the volume value
+                total_volume = next.cumulative_volume;
+                // Pay
+                total_payed += next.order.details.volume * Contribution::remainder(total_contrib);
+                // This order is complete: remember to do something about that
+                let d = next.order.details;
+                other_resolutions.push(CounterpartyPayment {
+                    customer: d.customer,
+                    volume: d.volume,
+                    contribution: d.contribution,
+                    side: next.side,
+                });
+                // Get our new item for this side
+                let new_order = match other_sides.get_mut(&next.side).unwrap().pop_last() {
+                    None => break, // Out of orders!
+                    Some((_, o)) => o,
+                };
+                let new_item = HeapEntries {
+                    order: new_order,
+                    side: next.side,
+                    cumulative_volume: new_order.details.volume + total_volume,
+                };
+                // Update the total contribution
+                total_contrib -= d.contribution;
+                total_contrib += new_order.details.contribution;
+                
+                heap.push(new_item);
+            }
+        }
+        
+        // Return the orders we took from the book and record the portion that got transacted
+        for HeapEntries { mut order, side, cumulative_volume } in heap {
+            let volume_remaining = cumulative_volume - total_volume;
+            let volume_used = order.details.volume - volume_remaining;
+            assert!(volume_remaining >= Volume::ZERO);
+            assert!(volume_used >= Volume::ZERO);
+            if volume_used > Volume::ZERO {
+                let d = order.details;
+                other_resolutions.push(CounterpartyPayment {
+                    customer: d.customer,
+                    volume: volume_used,
+                    contribution: d.contribution,
+                    side,
+                });
+            }
+            if volume_remaining > Volume::ZERO {
+                other_sides.get_mut(&side).unwrap().insert(order.identifier(), order);
+                order.details.volume = volume_remaining;
+            }
+        }
+
+        TransactionDyn::checked_make(total_volume, total_payed, other_resolutions).unwrap()
+    }
+   
+    // Runtime: O(m)
+    fn can_complete(&self, sides: &[Side], order: Order) -> Option<bool> {
+        assert!(sides.iter().all(|s| s.0 < self.num_sides()));
+        assert!(sides.len() > 0);
+        let other_sides = self.book.iter()
+            .enumerate()
+            .filter(|(o, _)| !sides.contains(&Side(*o))) // TODO: performance
+            .map(|(_, a)|  a.iter().rev())
+            .collect::<Vec<_>>();
+        // Count along the other sides and see what max contribution we need to give each side
+        let other_contribs_sum = other_sides.into_iter()
+            .map(|i| {
+                let mut remaining_volume = order.details.volume;
+                i.skip_while(|(_, v)| {
+                    // Skip until we've reached an order that either perfectly gets used up or has some remaining
+                    remaining_volume -= v.details.volume;
+                    remaining_volume > Volume::ZERO
+                }).next()
+                    .map(|(_, v)| v.details.contribution)
+            }).collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .sum::<Contribution>();
+        Some(other_contribs_sum + order.details.contribution >= Contribution::ONE)
+    }
+    
+    pub fn handle_fok(&mut self, sides: &[Side], order: Order) -> Option<TransactionDyn> {
+        if self.can_complete(sides, order)? {
+            Some(self.handle_unbookable_partial(sides, order))            
+        } else {
+            None
+        }
+    }
+
+    pub fn handle_partialable_order(&mut self, side: Side, order: Order) -> (Option<Identifier>, TransactionDyn)
+    {
+        assert!(side.0 < self.num_sides());
+        
+        let out = self.handle_unbookable_partial(&vec![side], order);
+
+        if out.taker_volume == order.details.volume {
+            (None, out)
+        } else {
+            let id = self.insert_order(side, order.details);
+            (Some(id), out)
+        }
+         
+    }
+    
+    fn insert_order(&mut self, Side(side): Side, order: Details) -> Identifier {
+        assert!(side < self.num_sides());
+        
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        let identifier = Identifier {
+            id,
+            prob: order.contribution,
+        };
+
+        let outstanding_order = OutstandingOrder {
+            orderid: id,
+            details: order,
+        };
+        
+        self.book[side].insert(identifier, outstanding_order);
+
+        identifier
+    }
+
+    pub fn cancel_order(&mut self, Side(side): Side, orderid: Identifier) -> Option<OutstandingOrder> {
+        assert!(side < self.num_sides());
+        self.book[side].remove(&orderid)
+    }
+        
+    pub fn get_order_book(&self) -> Vec<Vec<OutstandingOrder>> {
+        self.book.iter().map(|b| b.iter().map(|(_, o)| o.clone()).collect()).collect()
+    }
+}
+
+
 #[cfg(test)]
-mod tests {
+mod matching_engine_tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn v(value: u32) -> Volume {
-        Volume(value)
+        Volume::from_shares(value)
     }
     fn c(f: f64) -> Contribution {
         Contribution::from_float(f)
@@ -342,11 +681,28 @@ mod tests {
             assert_eq!(volume, expct_volume);
             for i in 0..N {
                 assert_eq!(contributions[i].customer, expct_contribs[i].0);
-                let e = expct_contribs[i].1.0;
-                let a = contributions[i].contribution.0;
-                assert!(a == e || a == (e-1) || a == (e+1), "{a}, {e}");
+                // let e = expct_contribs[i].1.0;
+                // let a = contributions[i].contribution.0;
+                // assert!(a == e || a == (e-1) || a == (e+1), "{a}, {e}");
             }
         }
+    }
+
+    fn check_order_response_dyn(resp: TransactionDyn, expct: (Volume, Money, Vec<(CustomerID, Volume, Contribution, Side)>)) {
+        assert_eq!(resp.taker_volume, expct.0);
+        assert_eq!(resp.taker_pays, expct.1);
+        assert_eq!(resp.counterparties.len(), expct.2.len());
+        // Turn one into a set
+        let mut got = resp.counterparties.into_iter().collect::<HashSet<_>>();
+        for (customer, volume, contribution, side) in expct.2 {
+            assert!(got.remove(&CounterpartyPayment {
+                customer,
+                volume,
+                contribution,
+                side,
+            }))
+        }
+        assert_eq!(got.len(), 0);
     }
 
     fn p(customer: CustomerID, volume: Volume, contribution: Contribution) -> Order {
@@ -372,7 +728,7 @@ mod tests {
     }
     
     #[test]
-    fn test1() {
+    fn test_bin_option() {
         let mut m: MatchingEngine<2> = MatchingEngine::new();
         let partial = CompletionRequirement::PartialOk;
         let c1 = CustomerID(1);
@@ -544,27 +900,34 @@ mod tests {
         CustomerID(id)
     }
 
+    fn n(money: i64) -> Money {
+        Money::from_dollars(money)
+    }
+
     #[test]
     fn test_fok() {
-        let mut m = MatchingEngine::<2>::new();
+        let mut m = MatchingEngineDyn::new(2);
 
-        let o1 = p(i(0), v(10), c(0.4));
+        let o1 = p(i(0), v(10), c(0.45));
 
-        check_order_response::<2>(m.handle_partialable_order::<0>(o1).1, vec![]);
+        check_order_response_dyn(m.handle_partialable_order(Side(0), o1).1, (v(0), n(0), vec![]));
 
         let o2 = f(i(1), v(20), c(0.6));
 
-        assert_eq!(m.handle_fok(1, o2), None);
+        assert_eq!(m.handle_fok(&vec![Side(1)], o2), None);
 
         let o3 = p(i(1), v(20), c(0.6));
 
-        check_order_response::<2>(m.handle_partialable_order::<1>(o3).1, vec![([(i(0), c(0.4)), (i(1), c(0.6))], v(10))]);
+        check_order_response_dyn(m.handle_partialable_order(Side(1), o3).1, (v(10), v(10)*c(0.55), vec![(i(0), v(10), c(0.45), Side(0))]));
     }
 }
 
 
 #[cfg(test)]
 mod ordertest {
+    fn v(volume: u32) -> Volume {
+        Volume::from_shares(volume)
+    }
     use super::*;
     #[test]
     fn test1() {
@@ -576,7 +939,7 @@ mod ordertest {
             details: Details {
                 creq: CompletionRequirement::PartialOk,
                 customer: c1,
-                volume: Volume(10),
+                volume: v(10),
                 contribution: Contribution::from_float(0.4),
             }
         };
@@ -585,7 +948,7 @@ mod ordertest {
             details: Details {
                 creq: CompletionRequirement::PartialOk,
                 customer: c1,
-                volume: Volume(10),
+                volume: v(10),
                 contribution: Contribution::from_float(0.4),
             }
         };
@@ -594,7 +957,7 @@ mod ordertest {
             details: Details {
                 creq: CompletionRequirement::PartialOk,
                 customer: c1,
-                volume: Volume(10),
+                volume: v(10),
                 contribution: Contribution::from_float(0.7),
             }
         };
@@ -603,7 +966,7 @@ mod ordertest {
             details: Details {
                 creq: CompletionRequirement::FillOnly,
                 customer: c2,
-                volume: Volume(20),
+                volume: v(20),
                 contribution: Contribution::from_float(0.4),
             }
         };

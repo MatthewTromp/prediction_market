@@ -2,7 +2,7 @@ use std::io::Write;
 
 use ciborium::into_writer;
 
-use crate::{positions::PosManager, Contribution, CustomerID, InstrumentID, Money, Position, Volume};
+use crate::{positions::PosManager, units::{Contribution, CustomerID, InstrumentID, Money, Position, Volume}};
 use crate::message::Message;
 
 type Error = Box<dyn std::error::Error + 'static>;

@@ -7,4 +7,5 @@ edition = "2021"
 ciborium = "0.2.2"
 ciborium-io = { version = "0.2.2", features = ["std"] }
 dotenvy = "0.15.7"
+priority-queue = "1.4.0"
 serde = "1.0.196"

@@ -1,10 +1,11 @@
 // Keeps tracks of everyone's positions and balances
 
-use std::{collections::{hash_map::Entry, HashMap}, io::Read};
+use std::{cmp::Reverse, collections::{hash_map::Entry, HashMap}, io::Read};
 
 use ciborium::from_reader_with_buffer;
+use priority_queue::PriorityQueue;
 
-use crate::{message::Message, Contribution, CustomerID, InstrumentID, Money, Position, Side, Volume};
+use crate::{message::Message, units::{Contribution, CustomerID, InstrumentID, Money, Position, Side, Volume}};
 
 type Error = Box<dyn std::error::Error + 'static>;
 
@@ -19,48 +20,47 @@ type Error = Box<dyn std::error::Error + 'static>;
 // values, subtracts it from all of them, and returns how much volume was just
 // cancelled out
 
+// There's actually an even better system we could use here, I think, which
+// involves a priorityqueue and has O(log(n)) performance, even when volume
+// gets cancelled out
+
+// How does that system actually work?
+// We maintain a priority queue of (side, cumulative_volume)
+
+#[derive(Debug)]
 struct PositionState {
-    volumes: Vec<Volume>,
-    non_zero: usize,
+    queue: PriorityQueue<Side, Reverse<Volume>>,
+    offset: Volume,
 }
 
 impl PositionState {
     pub fn new(num_sides: usize) -> Self {
         assert!(num_sides >= 2);
         Self {
-            volumes: vec![Volume(0); num_sides],
-            non_zero: num_sides,
+            queue: (0..num_sides).map(|n| (Side(n), Reverse(Volume::ZERO))).collect(),
+            offset: Volume::ZERO,
         }
     }
 
-    // Returns None if there was no cancellation, and the amount of volume
-    // cancelled out if there was cancellation
-    pub fn add_volume(&mut self, Side(index): Side, vol: Volume) -> Option<Volume> {
-        assert!(index < self.volumes.len());
-        let v = &mut self.volumes[index];
-        *v += vol;
-        if *v == vol {
-            // This used to be a zero. Decrement our count
-            self.non_zero -= 1;
-            if self.non_zero == 0 {
-                // We now have positive volume for all sides of this
-                // instrument
-                // Cancel out some volume
-                let v_to_rem = *self.volumes.iter().min().expect("Can't have a zero-sided instrument");
-                self.volumes.iter_mut().for_each(|v| *v -= v_to_rem);
-                self.non_zero = self.volumes.iter().filter(|v| **v == Volume::ZERO).count();
-                Some(v_to_rem)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    fn num_sides(&self) -> usize {
+        self.queue.len()
     }
 
-    pub fn get_volume(&self, Side(index): Side) -> Volume {
-        assert!(index < self.volumes.len());
-        self.volumes[index]
+    // Returns the amount of cancellation (0 if there was no cancellation)
+    pub fn add_volume(&mut self, side: Side, vol: Volume) -> Volume {
+        assert!(side.0 < self.num_sides());
+        let Reverse(old_v) = self.queue.get_priority(&side).unwrap();
+        self.queue.change_priority(&side, Reverse(*old_v + vol)).unwrap();
+        let (s, Reverse(v)) = self.queue.pop().expect("Impossible");
+        let out = v - self.offset;
+        self.offset = v;
+        self.queue.push(s, Reverse(self.offset));
+        out
+    }
+
+    pub fn get_volume(&self, side: Side) -> Volume {
+        assert!(side.0 < self.num_sides());
+        self.queue.get_priority(&side).map(|Reverse(v)| *v - self.offset).unwrap_or(Volume::ZERO)
     }
 }
 
@@ -146,14 +146,14 @@ impl PosManager {
             Entry::Vacant(v) => v.insert(PositionState::new(instrument.num_sides())),
         };
         match c_map.add_volume(side, volume) {
-            None => {},
-            Some(cancelled_volume) => {
+            Volume::ZERO => {},
+            cancelled_volume => {
                 // Need to credit the account
                 self.modify_balance(&account, cancelled_volume*Contribution::ONE)?;
             }
         }
         Ok(())
-        }
+    }
 
     pub fn get_position(&self, account: &CustomerID, Position(instrument, side): &Position) -> Option<Volume> {
         Some(self.positions.get(instrument)?.get(account)?.get_volume(*side))
@@ -169,7 +169,7 @@ impl PosManager {
                 Entry::Occupied(o) => o.into_mut(),
                 Entry::Vacant(v) => v.insert(PositionState::new(instrument.num_sides())),
             };
-            let cancelled = c_map.add_volume(side, volume).unwrap_or(Volume::ZERO);
+            let cancelled = c_map.add_volume(side, volume);
             // Modify balance
             let b = self.balances.get_mut(cid).expect("Customer not found"); // Panic instead of error because we're now in an invalid state
             *b -= volume * *contrib;
@@ -180,4 +180,39 @@ impl PosManager {
     }
 
     
+}
+#[cfg(test)]
+mod pos_state_tests {
+    fn v(value: u32) -> Volume {
+        Volume::from_shares(value)
+    }
+
+    use super::*;
+    #[test]
+    fn binary_test() {
+        let mut s = PositionState::new(2);
+        println!("{:?}", s);
+        assert_eq!(s.add_volume(Side(0), v(10)), Volume::ZERO);
+        println!("{:?}", s);
+        assert_eq!(s.get_volume(Side(0)), v(10));
+        assert_eq!(s.add_volume(Side(1), v(21)), v(10));
+        println!("{:?}", s);
+        assert_eq!(s.get_volume(Side(0)), v(0));
+        assert_eq!(s.get_volume(Side(1)), v(11));
+        assert_eq!(s.add_volume(Side(0), v(4)), v(4));
+        println!("{:?}", s);
+        assert_eq!(s.get_volume(Side(0)), v(0));
+        assert_eq!(s.get_volume(Side(1)), v(7));
+    }
+
+    #[test]
+    fn trinary_test() {
+        let mut s = PositionState::new(3);
+        assert_eq!(s.add_volume(Side(0), v(10)), Volume::ZERO);
+        assert_eq!(s.add_volume(Side(1), v(15)), Volume::ZERO);
+        assert_eq!(s.add_volume(Side(2), v(5)), v(5));
+        assert_eq!(s.get_volume(Side(0)), v(5));
+        assert_eq!(s.get_volume(Side(1)), v(10));
+        assert_eq!(s.get_volume(Side(2)), v(0));
+    }
 }
