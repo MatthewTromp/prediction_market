@@ -5,7 +5,7 @@ use std::{cmp::Reverse, collections::{hash_map::Entry, HashMap}, io::Read};
 use ciborium::from_reader_with_buffer;
 use priority_queue::PriorityQueue;
 
-use crate::{message::Message, units::{Contribution, CustomerID, InstrumentID, Money, Position, Side, Volume}};
+use crate::{message::PosManagerMessage, units::{Contribution, CustomerID, InstrumentID, Money, Position, Side, Volume}};
 
 type Error = Box<dyn std::error::Error + 'static>;
 
@@ -86,7 +86,7 @@ impl PosManager {
         let mut out = Self::new();
         let mut buffer = vec![0; 65536];
         loop {
-            match from_reader_with_buffer::<Message, _>(&mut *source, &mut buffer) {
+            match from_reader_with_buffer::<PosManagerMessage, _>(&mut *source, &mut buffer) {
                 Ok(message) => out.apply_message(message),
                 Err(ciborium::de::Error::Io(io_error)) => {
                     match io_error.kind() {
@@ -101,13 +101,13 @@ impl PosManager {
         }
     }
     
-    fn apply_message(&mut self, message: Message) {
+    fn apply_message(&mut self, message: PosManagerMessage) {
         match message {
-            Message::AddCustomer(cid, bal) => {self.add_customer(cid, bal);},
-            Message::ModifyBalance(cid, amt) => {let _ = self.modify_balance(&cid, amt);},
-            Message::CreateInstrument(iid) => {let _ = self.create_instrument(iid);},
-            Message::CreditPosition(cid, pos, vol) => {let _ = self.credit_position(cid, pos, vol);},
-            Message::HandleTransaction(iid, vol, contribs) => {let _ = self.handle_transaction(&iid, vol, &contribs);}
+            PosManagerMessage::AddCustomer(cid, bal) => {self.add_customer(cid, bal);},
+            PosManagerMessage::ModifyBalance(cid, amt) => {let _ = self.modify_balance(&cid, amt);},
+            PosManagerMessage::CreateInstrument(iid) => {let _ = self.create_instrument(iid);},
+            PosManagerMessage::CreditPosition(cid, pos, vol) => {let _ = self.credit_position(cid, pos, vol);},
+            PosManagerMessage::HandleTransaction(iid, vol, contribs) => {let _ = self.handle_transaction(&iid, vol, &contribs);}
         }
     }
 

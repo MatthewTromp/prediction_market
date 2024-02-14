@@ -74,65 +74,6 @@ impl PartialOrd for OutstandingOrder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PH1 {
-    pub customer: CustomerID,
-    pub contribution: Contribution,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Transaction<const N: usize> {
-    pub contributions: [PH1; N],
-    pub volume: Volume,
-}
-
-#[derive(Debug)]
-enum TransactionOutcome<const N: usize> {
-    Failure,
-    Success(Transaction<N>, Vec<usize>),
-}
-
-fn make_transaction<const N: usize> (orders: [& mut Details; N]) -> TransactionOutcome<N> {
-    use TransactionOutcome::*;
-    match Contribution::share_contribs::<N>(orders.each_ref().map(|o| (**o).contribution)) {
-        None => {
-            Failure
-        }
-        Some(contribs) => {
-            let volume = orders.iter()
-                .map(|o| o.volume)
-                .min()
-                .unwrap();
-            assert!(volume > Volume::ZERO);
-            let mut to_remove = vec![];
-            for i in 0..N {
-                orders[i].volume -= volume;
-                if orders[i].volume == Volume::ZERO {
-                    to_remove.push(i);
-                }
-            }
-            let mut c_i = contribs.into_iter();
-            Success(Transaction {
-                contributions: orders.map(|o| PH1 {
-                    customer: o.customer,
-                    contribution: c_i.next().unwrap(),
-                    }),
-                // contributions: orders.into_iter().zip(contribs.iter()).map(|(o, &contribution)| PH1 {
-                //     customer: o.customer,
-                //     contribution,
-                // }).collect::<Vec<PH1>>().try_into().unwrap(),
-                volume
-            }, to_remove)
-        }
-    }
-}
-
-#[derive(Debug)]
-struct MatchingEngine<const N: usize> {
-    book: [BTreeMap<Identifier, OutstandingOrder>; N],
-    next_id: u64,
-}
-
 // So, how do we get this to work properly?
 // We need to be able to efficiently
 // - Add an order to the order book
@@ -239,98 +180,87 @@ struct MatchingEngine<const N: usize> {
 // separate "transaction" concept for every new participant in the
 // transaction.
 
-// Can we handle combinatorial orders in the book?
+// Can we handle (intra-instrument) combinatorial orders in the book?
 //  i.e. I want to buy sides 1 + 2 + 5 of this 7-side instrument
-//  
+// The problem is that, if we don't, we might get order spammed 
 
-impl<const N: usize> MatchingEngine<N> {
-    fn new() -> Self {
-        MatchingEngine {
-            book: [(); N].map(|()| BTreeMap::new()),
-            next_id: 1,
-        }
-    }
+// "no" orders (all-but-one):
+//  - Should probably be supportable so we're not worse than binary
+//    options contracts
+//  - Could maintain a second set of books for those?
+//  - When we get a single
 
-    pub fn handle_unbookable_partial<const I: usize>(&mut self, order: Order) -> Vec<Transaction<N>> {
-        let (id, transes) = self.handle_partialable_order::<I>(order);
-        if let Some(id) = id {
-            assert!(self.cancel_order::<I>(id).is_some());
-        }
-        transes
-    }
+// Dynamicaly tracking the price of combinations?
+// Is it possible to have a data structure that's, say, O(m*logi)
+// where i is the number of unique order combinations??
+// Maybe some kind of tree where we build up combinations out of
+// constituent parts?
 
-    pub fn handle_fok(&mut self, sides: &[Side], _order: Order) -> Option<Vec<Transaction<N>>> {
-        assert!(sides.iter().all(|s| s.0 < N));
-        let mut iters = self.book.each_ref().map(|b| b.iter());
-        let _i = iters.each_mut().map(|i| i.next());
-        
-        todo!();
-    }
+// How does combining a no with something else work?
+//  If I combine a "no bob" with a "no alice", what does that even
+// look like?
+//  It's nonsense: Combining yeses makes sense, but combining nos
+// makes no sense. Some of the probability of "no bob" is alice
+// being elected. Whereas when we combine "yes bob" and "yes alice",
+// that's fine, because they're disjoint
+//  Rather, "yes bob" OR "yes alice" makes sense, whereas "no bob"
+// AND "no alice" is how you would combine those contracts. And
+// we don't really have support for that.
+//  Hmmmm... In a binary options market, when I buy "yes bob" and
+// "yes alice", I'm buying from someone who thinks anyone other
+// than bob will win (including alice) and from someone who thinks
+// anyone other than alice will win (including bob). This is kinda
+// weird. So basically, no contracts don't combine the same way
+// yeses do. I think?
+//  But what actually stops me from constructing a "yes everyone
+// other than alice and bob" from a "no bob" and "no alice"
+//  I guess when you combine them, you get 2 volume on everyone
+// except alice and bob, who each have only one volume
+//  So then when someone comes along saying "it's either alice or
+// bob", there's a total of 2 volume created
+//  When you buy NO on everything, that's the same as buying n YES
+// on everything. This is an arbitrage opportunity
 
-    pub fn handle_partialable_order<const I: usize>(&mut self, order: Order) -> (Option<Identifier>, Vec<Transaction<N>>)
-    {
-        assert!(I < N);
+//  But, it should still be possible to buy nos. If you have secret
+// information about bob that tells you he's probably gonna lose,
+// you want to be able to trade on that.
+//  Full combinatorial is better, of course. If you have information
+// saying the Orange party is more likely to win than the market
+// thinks, but we're not sure about who the orange party candidate
+// is yet, you want to be able to buy yes on all the orange
+// candidates.
 
-        let mut identifier = Some(self.insert_order::<I>(order.details));
+//  I mean really, we already support combinatorial orders. We just
+// need to be able to also support them in the book.
+//  But not AON because that's totally unprincipled
 
-        let mut transactions = vec![];
+// How to handle nos:
+//  - Separate books, one for each side
+//  - When a single-sided yes order comes in, we check it against the 
+//    nos and also against all the other yeses put together
+//  - For a combinatorial order, we can compare all the not included
+//    yeses against all the included nos and take the best price?
 
-        loop {
-            let entries = self.book.each_mut().map(|k|
-                   k.last_entry());
-            if entries.iter().any(|v| v.is_none()) { break };
-            let orders = entries.map(|e| e.unwrap().into_mut());
-            let orders = orders.map(|o| &mut o.details);
-            match make_transaction(orders) {
-                TransactionOutcome::Failure => {
-                    break;
-                }
-                TransactionOutcome::Success(a, b) => {
-                    transactions.push(a);
-                    for i in b {
-                        let removed = self.book[i].pop_last();
-                        if identifier.as_ref().is_some_and(|i| removed.as_ref().is_some_and(|(i2, _)| i2.id == i.id)) {
-                            identifier = None;
-                        }
-                        assert_eq!(removed.map(|(_, o)| o.details.volume), Some(Volume::ZERO));
-                    }
-                }
-            }
-        }
+//  Let's say we just have a pile of combinatorial book orders. How
+// could we efficiently match against this?
+//  Is there DP stuff we could do?
+//  This looks to effectively be the exact cover problem, which is
+// NP complete. It's even worse too, because we need to find all of
+// them.
+//  And if we can't handle this, then either we're gonna get spam or
+// people are going to make new markets, and both of those are
+// terrible options.
 
-        (identifier, transactions)
-    }
-    
-    fn insert_order<const I: usize>(&mut self, order: Details) -> Identifier {
-        assert!(I < N);
-        
-        let id = self.next_id;
-        self.next_id += 1;
-        
-        let identifier = Identifier {
-            id,
-            prob: order.contribution,
-        };
+//  What if we have a limited number of subsets? Or we only try matching
+// if a given subset has enough volume and an attractive enough price
 
-        let outstanding_order = OutstandingOrder {
-            orderid: id,
-            details: order,
-        };
-        
-        self.book[I].insert(identifier, outstanding_order);
+//  If we have a limited number of subsets then we could concievably
+// solve the problem ahead of time for... well it couldn't be for any
+// possible subset...
+//  I mean maybe it could be. For a 10-option cotract, there's only
+// 2^10 = 1024 possibilities
 
-        identifier
-    }
-
-    pub fn cancel_order<const I: usize>(&mut self, orderid: Identifier) -> Option<OutstandingOrder> {
-        assert!(I < N);
-        self.book[I].remove(&orderid)
-    }
-        
-    pub fn get_order_book(&self) -> [Vec<OutstandingOrder>; N] {
-        self.book.each_ref().map(|b| b.iter().map(|(_, o)| o.clone()).collect())
-    }
-}
+// 
 
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -351,14 +281,14 @@ pub struct TransactionDyn {
 #[derive(Debug, Clone)]
 enum TransactionCreationError {
     BadVolume,
-    BadMoney,
+    BadMoney(Money, Money),
 }
 
 impl fmt::Display for TransactionCreationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             TransactionCreationError::BadVolume => write!(f, "Volumes don't add up"),
-            TransactionCreationError::BadMoney => write!(f, "Money doesn't add up"),
+            TransactionCreationError::BadMoney(e, g) => write!(f, "Money doesn't add up: total payment is {e:?} but should be {g:?}"),
         }
     }
 }
@@ -370,7 +300,7 @@ impl TransactionDyn {
         // Some sanity checks
         let total_money_in = taker_pays + counterparties.iter().map(|o| o.volume*o.contribution).sum();
         if total_money_in != taker_volume * Contribution::ONE {
-            return Err(TransactionCreationError::BadMoney);
+            return Err(TransactionCreationError::BadMoney(total_money_in, taker_volume*Contribution::ONE));
         }
         let mut sidevols = HashMap::new();
         for CounterpartyPayment { customer: _, volume: v, contribution: _, side: s } in counterparties.iter() {
@@ -392,7 +322,7 @@ impl TransactionDyn {
 
 
 #[derive(Debug)]
-pub struct MatchingEngineDyn {
+pub struct MatchingEngine {
     book: Vec<BTreeMap<Identifier, OutstandingOrder>>,
     next_id: u64,
 }
@@ -437,7 +367,7 @@ pub struct MatchingEngineDyn {
 // at the first attempted match
 
 
-impl MatchingEngineDyn {
+impl MatchingEngine {
     fn new(num_sides: usize) -> Self {
         Self {
             book: vec![BTreeMap::new(); num_sides],
@@ -449,7 +379,7 @@ impl MatchingEngineDyn {
         self.book.len()
     }
 
-    pub fn handle_unbookable_partial(&mut self, sides: &[Side], order: Order) -> TransactionDyn {
+    pub fn handle_unbookable_partial(&mut self, sides: &[Side], taker_order: Order) -> TransactionDyn {
         #[derive(PartialEq, Eq)]
         struct HeapEntries {
             order: OutstandingOrder,
@@ -494,7 +424,7 @@ impl MatchingEngineDyn {
             })
             .collect::<Vec<_>>();
         
-        let mut total_contrib = init.iter()
+        let mut book_contrib = init.iter()
             .map(|HeapEntries { order, side: _, cumulative_volume: _}| order.details.contribution)
             .sum();
 
@@ -502,10 +432,10 @@ impl MatchingEngineDyn {
         
         let mut heap = BinaryHeap::from(init);
         let mut total_volume = Volume::ZERO;
-        let volume_limit = order.details.volume;
+        let volume_limit = taker_order.details.volume;
         let mut total_payed = Money::ZERO;
 
-        while Contribution::is_enough(total_contrib, order.details.contribution) && total_volume < volume_limit {
+        while Contribution::is_enough(book_contrib, taker_order.details.contribution) && total_volume < volume_limit {
             let next = heap.pop().unwrap();
             if next.cumulative_volume > volume_limit {
                 // We're done, and have some extra for this order
@@ -513,25 +443,25 @@ impl MatchingEngineDyn {
                 // Correct the total volume we've gone through
                 total_volume = volume_limit;
                 let HeapEntries { order: mut order_to_return, side, cumulative_volume: _ } = next;
-                order_to_return.details.volume -= volume_used;
                 // Pay
-                total_payed += volume_used * Contribution::remainder(total_contrib);
+                total_payed += volume_used * Contribution::remainder(book_contrib);
                 let d = order_to_return.details;
                 // Record this party's payment
                 other_resolutions.push(CounterpartyPayment {
                     customer: d.customer,
-                    volume: d.volume,
+                    volume: volume_used,
                     contribution: d.contribution,
                     side,
                 });
                 // Put this back in the book
+                order_to_return.details.volume -= volume_used;
                 other_sides.get_mut(&next.side).unwrap().insert(order_to_return.identifier(), order_to_return);
             } else {
                 // We've exhausted this book order
                 // Correct the volume value
                 total_volume = next.cumulative_volume;
                 // Pay
-                total_payed += next.order.details.volume * Contribution::remainder(total_contrib);
+                total_payed += next.order.details.volume * Contribution::remainder(book_contrib);
                 // This order is complete: remember to do something about that
                 let d = next.order.details;
                 other_resolutions.push(CounterpartyPayment {
@@ -551,8 +481,8 @@ impl MatchingEngineDyn {
                     cumulative_volume: new_order.details.volume + total_volume,
                 };
                 // Update the total contribution
-                total_contrib -= d.contribution;
-                total_contrib += new_order.details.contribution;
+                book_contrib -= d.contribution;
+                book_contrib += new_order.details.contribution;
                 
                 heap.push(new_item);
             }
@@ -574,8 +504,8 @@ impl MatchingEngineDyn {
                 });
             }
             if volume_remaining > Volume::ZERO {
-                other_sides.get_mut(&side).unwrap().insert(order.identifier(), order);
                 order.details.volume = volume_remaining;
+                other_sides.get_mut(&side).unwrap().insert(order.identifier(), order);
             }
         }
 
@@ -615,7 +545,7 @@ impl MatchingEngineDyn {
         }
     }
 
-    pub fn handle_partialable_order(&mut self, side: Side, order: Order) -> (Option<Identifier>, TransactionDyn)
+    pub fn handle_partialable_order(&mut self, side: Side, mut order: Order) -> (Option<Identifier>, TransactionDyn)
     {
         assert!(side.0 < self.num_sides());
         
@@ -624,6 +554,7 @@ impl MatchingEngineDyn {
         if out.taker_volume == order.details.volume {
             (None, out)
         } else {
+            order.details.volume -= out.taker_volume;
             let id = self.insert_order(side, order.details);
             (Some(id), out)
         }
@@ -675,32 +606,14 @@ mod matching_engine_tests {
         Contribution::from_float(f)
     }
 
-    fn check_order_response<const N: usize>(resp: Vec<Transaction<N>>, expct: Vec<([(CustomerID, Contribution); N], Volume)>) {
-        assert_eq!(resp.len(), expct.len());
-        for (Transaction { contributions, volume }, (expct_contribs, expct_volume)) in resp.iter().zip(expct.iter()) {
-            assert_eq!(volume, expct_volume);
-            for i in 0..N {
-                assert_eq!(contributions[i].customer, expct_contribs[i].0);
-                // let e = expct_contribs[i].1.0;
-                // let a = contributions[i].contribution.0;
-                // assert!(a == e || a == (e-1) || a == (e+1), "{a}, {e}");
-            }
-        }
-    }
-
-    fn check_order_response_dyn(resp: TransactionDyn, expct: (Volume, Money, Vec<(CustomerID, Volume, Contribution, Side)>)) {
-        assert_eq!(resp.taker_volume, expct.0);
-        assert_eq!(resp.taker_pays, expct.1);
-        assert_eq!(resp.counterparties.len(), expct.2.len());
+    fn check_order_response_dyn(resp: TransactionDyn, expct: TransactionDyn) {
+        assert_eq!(resp.taker_volume, expct.taker_volume);
+        assert_eq!(resp.taker_pays, expct.taker_pays);
+        assert_eq!(resp.counterparties.len(), expct.counterparties.len());
         // Turn one into a set
         let mut got = resp.counterparties.into_iter().collect::<HashSet<_>>();
-        for (customer, volume, contribution, side) in expct.2 {
-            assert!(got.remove(&CounterpartyPayment {
-                customer,
-                volume,
-                contribution,
-                side,
-            }))
+        for c in expct.counterparties {
+            assert!(got.remove(&c));
         }
         assert_eq!(got.len(), 0);
     }
@@ -726,10 +639,41 @@ mod matching_engine_tests {
             }
         }
     }
-    
+
+    fn no_trans() -> TransactionDyn {
+        TransactionDyn {
+            taker_volume: v(0),
+            taker_pays: n(0),
+            counterparties: vec![],
+        }
+    }
+
+    fn o(customer: CustomerID, volume: Volume, contribution: Contribution) -> Order {
+        Order {
+            details: Details {
+                creq: CompletionRequirement::PartialOk,
+                customer,
+                volume,
+                contribution,
+            }
+        }
+    }
+
+    fn t(volume: Volume, money: Money, cs: Vec<(CustomerID, Volume, Contribution, Side)>) -> TransactionDyn {
+        TransactionDyn::checked_make(volume, money, cs.into_iter().map(|(id, v, c, s)| CounterpartyPayment { customer: id, volume: v, contribution: c, side: s }).collect()).unwrap()
+        
+    }
+
+    #[test]
+    fn test_make_transaction() {
+        let c1 = CustomerID(1);
+        t(v(3), v(3)*c(0.4), vec![(c1, v(3), c(0.6), Side(1))]);
+        t(v(20), v(7)*c(0.4) + v(13)*c(0.7), vec![(c1, v(7), c(0.6), Side(1)), (c1, v(13), c(0.3), Side(1))]);
+    }
+
     #[test]
     fn test_bin_option() {
-        let mut m: MatchingEngine<2> = MatchingEngine::new();
+        let mut m = MatchingEngine::new(2);
         let partial = CompletionRequirement::PartialOk;
         let c1 = CustomerID(1);
         let c2 = CustomerID(2);
@@ -740,160 +684,90 @@ mod matching_engine_tests {
         let c7 = CustomerID(7);
         let c8 = CustomerID(8);
 
-        let mut o0 = Order {
-            details: Details {
-                creq: partial,
-                customer: c1,
-                volume: v(10),
-                contribution: c(0.6),
-            }
-        };
+        let mut o0 = o(c1, v(10), c(0.6));
 
-        assert_eq!(m.handle_partialable_order::<1>(o0.clone()).1, vec![]);
+        assert_eq!(m.handle_partialable_order(Side(1), o0.clone()).1, no_trans());
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![], vec![o0.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![], vec![o0.clone().details]]);
 
-        let mut o1 = Order {
-            details: Details {
-                creq: partial,
-                customer: c2,
-                volume: v(20),
-                contribution: c(0.3),
-            }
-        };
+        let mut o1 = o(c2, v(20), c(0.3));
 
-        assert_eq!(m.handle_partialable_order::<1>(o1.clone()).1, vec![]);
+        assert_eq!(m.handle_partialable_order(Side(1), o1.clone()).1, no_trans());
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![], vec![o1.clone().details, o0.clone().details]]);
-        let o2 = Order {
-            details: Details {
-                creq: partial,
-                customer: c5,
-                volume: v(30),
-                contribution: c(0.3),
-            }
-        };
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![], vec![o1.clone().details, o0.clone().details]]);
+        let o2 = o(c5, v(30), c(0.3));
         
-        assert_eq!(m.handle_partialable_order::<0>(o2.clone()).1, vec![]);
+        assert_eq!(m.handle_partialable_order(Side(0), o2.clone()).1, no_trans());
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o2.clone().details], vec![o1.clone().details, o0.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o2.clone().details], vec![o1.clone().details, o0.clone().details]]);
 
-        let o3 = Order {
-            details: Details {
-                creq: partial,
-                customer: c3,
-                volume: v(3),
-                contribution: c(0.6),
-            }
-        };
+        let o3 = o(c3, v(3), c(0.6));
 
-        check_order_response::<2>(m.handle_partialable_order::<0>(o3.clone()).1, vec![([(c3, c(0.5)), (c1, c(0.5))], v(3))]);
+        check_order_response_dyn(m.handle_partialable_order(Side(0), o3.clone()).1, t(v(3), v(3)*c(0.4), vec![(c1, v(3), c(0.6), Side(1))]));
 
         o0.details.volume -= v(3);
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o2.clone().details], vec![o1.clone().details, o0.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o2.clone().details], vec![o1.clone().details, o0.clone().details]]);
 
-        let o4 = Order {
-            details: Details {
-                creq: partial,
-                customer: c4,
-                volume: v(20),
-                contribution: c(0.8)
-            }
-        };
+        let o4 = o(c4, v(20), c(0.8));
  
-        check_order_response::<2>(m.handle_partialable_order::<0>(o4.clone()).1, vec![([(c4, c(0.8/(0.8+0.6))), (c1, c(0.6/(0.8+0.6)))], v(7)),
-                                                                                      ([(c4, c(0.8/(0.8+0.3))), (c2, c(0.3/(0.8+0.3)))], v(13))]);
+        check_order_response_dyn(m.handle_partialable_order(Side(0), o4.clone()).1, t(v(20), v(7)*c(0.4) + v(13)*c(0.7), vec![(c1, v(7), c(0.6), Side(1)), (c2, v(13), c(0.3), Side(1))]));
 
         o1.details.volume -= v(13);
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o2.clone().details], vec![o1.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o2.clone().details], vec![o1.clone().details]]);
 
-        let mut o5 = Order {
-            details: Details {
-                creq: partial,
-                customer: c7,
-                volume: v(20),
-                contribution: c(0.8)
-            }
-        };
+        let mut o5 = o(c7, v(20), c(0.8));
         
-        check_order_response::<2>(m.handle_partialable_order::<0>(o5.clone()).1, vec![([(c7, c(0.8/(0.8 + 0.3))), (c2, c(0.3/(0.8+0.3)))], v(7))]);
+        check_order_response_dyn(m.handle_partialable_order(Side(0), o5.clone()).1, t(v(7), v(7)*c(0.7), vec![(c2, v(7), c(0.3), Side(1))]));
         
 
         o5.details.volume -= v(7);
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o2.clone().details, o5.clone().details], vec![]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o2.clone().details, o5.clone().details], vec![]]);
 
-        let mut o6 = Order {
-            details: Details {
-                creq: partial,
-                customer: c6,
-                volume: v(100),
-                contribution: c(1.0),
-            }
-        };
+        let mut o6 = o(c6, v(100), c(1.0));
 
-        check_order_response::<2>(m.handle_partialable_order::<1>(o6.clone()).1, vec![([(c7, c(0.8/(1.8))), (c6, c(1.0/(1.8)))], v(13)),
-                                                                                      ([(c5, c(0.3/1.3)), (c6, c(1.0/1.3))], v(30))]);
-
+        check_order_response_dyn(m.handle_partialable_order(Side(1), o6.clone()).1, t(v(13), v(13)*c(1.0), vec![(c7, v(13), c(0.8), Side(0))]));
+        
         o6.details.volume -= v(43);
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![], vec![o6.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![], vec![o6.clone().details]]);
     }
 
     #[test]
     fn test_cancellation() {
         let partial = CompletionRequirement::PartialOk;
         
-        let mut m = MatchingEngine::new();
+        let mut m = MatchingEngine::new(2);
 
         let c1 = CustomerID(1);
         let c2 = CustomerID(2);
         let c3 = CustomerID(3);
 
-        let o1 = Order {
-            details: Details {
-                creq: partial,
-                customer: c1,
-                volume: v(20),
-                contribution: c(0.3),
-            }
-        };
+        let o1 = o(c1, v(20), c(0.3));
 
-        let o2 = Order {
-            details: Details {
-                creq: partial,
-                customer: c2,
-                volume: v(20),
-                contribution: c(0.3),
-            }
-        };
+        let o2 = o(c2, v(20), c(0.3));
 
-        let o3 = Order {
-            details: Details {
-                creq: partial,
-                customer: c3,
-                volume: v(20),
-                contribution: c(0.4),
-            }
-        };
+        let o3 = o(c3, v(20), c(0.4));
 
-        let id1 = m.handle_partialable_order::<1>(o1.clone()).0.unwrap();
-        let id2 = m.handle_partialable_order::<0>(o2.clone()).0.unwrap();
-        let id3 = m.handle_partialable_order::<0>(o3.clone()).0.unwrap();
+        let id1 = m.handle_partialable_order(Side(1), o1.clone()).0.unwrap();
+        let r = m.handle_partialable_order(Side(0), o2.clone());
+        println!("{r:?}");
+        let id2 = r.0.unwrap();
+        let id3 = m.handle_partialable_order(Side(0), o3.clone()).0.unwrap();
 
-        assert_eq!(m.cancel_order::<0>(id2.clone()).map(|o| o.details), Some(o2.clone().details));
+        assert_eq!(m.cancel_order(Side(0), id2.clone()).map(|o| o.details), Some(o2.clone().details));
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o3.clone().details], vec![o1.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o3.clone().details], vec![o1.clone().details]]);
 
-        assert_eq!(m.cancel_order::<0>(id2).map(|o| o.details), None);
+        assert_eq!(m.cancel_order(Side(0), id2).map(|o| o.details), None);
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o3.clone().details], vec![o1.clone().details]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o3.clone().details], vec![o1.clone().details]]);
         
-        assert_eq!(m.cancel_order::<1>(id1).map(|o| o.details), Some(o1.clone().details));
+        assert_eq!(m.cancel_order(Side(1), id1).map(|o| o.details), Some(o1.clone().details));
 
-        assert_eq!(m.get_order_book().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()), [vec![o3.details], vec![]]);
+        assert_eq!(m.get_order_book().into_iter().map(|v| v.into_iter().map(|o| o.details).collect::<Vec<Details>>()).collect::<Vec<_>>(), vec![vec![o3.details], vec![]]);
     }
 
     fn i(id: usize) -> CustomerID {
@@ -906,11 +780,11 @@ mod matching_engine_tests {
 
     #[test]
     fn test_fok() {
-        let mut m = MatchingEngineDyn::new(2);
+        let mut m = MatchingEngine::new(2);
 
         let o1 = p(i(0), v(10), c(0.45));
 
-        check_order_response_dyn(m.handle_partialable_order(Side(0), o1).1, (v(0), n(0), vec![]));
+        check_order_response_dyn(m.handle_partialable_order(Side(0), o1).1, t(v(0), n(0), vec![]));
 
         let o2 = f(i(1), v(20), c(0.6));
 
@@ -918,7 +792,7 @@ mod matching_engine_tests {
 
         let o3 = p(i(1), v(20), c(0.6));
 
-        check_order_response_dyn(m.handle_partialable_order(Side(1), o3).1, (v(10), v(10)*c(0.55), vec![(i(0), v(10), c(0.45), Side(0))]));
+        check_order_response_dyn(m.handle_partialable_order(Side(1), o3).1, t(v(10), v(10)*c(0.55), vec![(i(0), v(10), c(0.45), Side(0))]));
     }
 }
 

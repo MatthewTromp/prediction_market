@@ -1,3 +1,6 @@
+// NOTE This does not work properly! It doesn't maintain any sensible order
+// between orders with the same contribution
+
 // OneChronos style auction system
 //  We collect a bunch of orders, then run an auction between them periodically
 //  For a simple two-side transaction with only partialable orders and no
