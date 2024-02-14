@@ -65,6 +65,7 @@ and you buy 100 shares of "NO A" and 200 shares of "NO B",
 what you've actually bought is
 - 100 shares each of "YES B", "YES C" and "YES D"
 - 200 shares each of "YES A", "YES C" and "YES D"
+
 So you now have 200 shares of A, 100 shares of B, 300 shares of C and 300 shares of D.
 
 100 of each of these shares cancel each other out,
